@@ -4,7 +4,8 @@
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
+
 
 # Thumbnails
 ._*
@@ -173,3 +174,8 @@ cython_debug/
 
 # Local History for Visual Studio Code
 .history/
+
+__try__.py
+outputs/*
+!outputs/ponet-base-uncased/
+logs/*

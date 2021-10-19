@@ -1,0 +1,10 @@
+torch >= 1.8.0
+transformers == 4.7.0
+datasets >= 1.1.3
+sentencepiece != 0.1.92
+protobuf
+tensorboardX == 2.1
+fairscale
+scipy
+sklearn
+# pip install torch-scatter -f https://pytorch-geometric.com/whl/torch-1.8.0+cu102.html
