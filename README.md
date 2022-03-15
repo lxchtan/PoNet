@@ -43,14 +43,14 @@ Please refer to the shell file under the `run_shell` folder.
 - [ ] release the source code
   - [x] [2021.10.19] Pre-train Tasks 
   - [x] [2021.10.19] GLUE Tasks
-  - [ ] LRA Tasks
+  - [x] [2022.03.15] LRA Tasks
   - [ ] Long-Text Tasks
 - [x] [2021.10.19] release the pretrained checkpoints
 
 ## Cite
 
 ```bibtex
-@article{DBLP:journals/corr/abs-2110-02442,
+@inproceedings{DBLP:journals/corr/abs-2110-02442,
   author    = {Chao{-}Hong Tan and
                Qian Chen and
                Wen Wang and
@@ -58,11 +58,10 @@ Please refer to the shell file under the `run_shell` folder.
                Siqi Zheng and
                Zhen{-}Hua Ling},
   title     = {{PoNet}: Pooling Network for Efficient Token Mixing in Long Sequences},
-  journal   = {CoRR},
-  volume    = {abs/2110.02442},
-  year      = {2021},
-  url       = {https://arxiv.org/abs/2110.02442},
-  archivePrefix = {arXiv},
-  eprint    = {2110.02442}
+  booktitle = {10th International Conference on Learning Representations, {ICLR} 2022,
+               Virtual Event, April 25-29, 2022},
+  publisher = {OpenReview.net},
+  year      = {2022},
+  url       = {https://openreview.net/forum?id=9jInD9JjicF},
 }
 ```
