@@ -3,7 +3,7 @@ MODEL=outputs/ponet-base-uncased
 OUTPRE=`pwd`
 
 if [ ! -d logs/glue ]; then
-  mkdir logs/glue
+  mkdir -p logs/glue
 fi
 
 cal_mlp(){

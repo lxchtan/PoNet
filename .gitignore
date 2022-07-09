@@ -175,7 +175,6 @@ cython_debug/
 # Local History for Visual Studio Code
 .history/
 
-__try__.py
+datasets/arxiv-11/data
 outputs/*
-!outputs/ponet-base-uncased/
 logs/*

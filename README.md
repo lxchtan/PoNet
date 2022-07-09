@@ -3,21 +3,6 @@
 This is a code repository for our paper ***[PoNet: Pooling Network for Efficient Token Mixing in Long Sequences](https://arxiv.org/abs/2110.02442)***.
 The full source code will be released soon.
 
-## Requirements
-
-If you want to clone with the checkpoint, `git-lfs` is needed. And then use the code
-
-```shell
-git lfs install
-git clone https://github.com/lxchtan/PoNet
-```
-
-If you want to clone without large files,
-
-```shell
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/lxchtan/PoNet
-```
-
 ##### Python environment
 
 The requirements package is in `requirements.txt`.
@@ -36,16 +21,51 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-1.8.2+cu102.html
 
 ## Instruction
 
-Please refer to the shell file under the `run_shell` folder.
+##### Initialize
 
-## TODO
+`git clone https://github.com/lxchtan/PoNet `
 
-- [ ] release the source code
+Download checkpoints on [GDrive](https://drive.google.com/file/d/1gfV5lpg-3JW9ZgbgXOyyAmHqA7Q4OEJk), and place into `outputs`.
+
+`tar -zxcf ponet-base-uncased.tar.gz`
+
+Then you can get the following files.
+
+```bash
+outputs
+└── ponet-base-uncased
+    ├── config.json
+    ├── pytorch_model.bin
+    ├── special_tokens_map.json
+    ├── tokenizer_config.json
+    ├── tokenizer.json
+    └── vocab.txt
+```
+
+##### Special for Arxiv-11 Dataset
+
+The data can be obtained from `https://github.com/LiqunW/Long-document-dataset`.
+
+We also provided a scripts to get it. Please refer to the shell file `run_shell/D1-arxiv11.sh`.
+
+##### Run
+
+For Pre-train, GLUE and Long-Text, please refer to the shell files under the `run_shell` folder.
+
+For LRA, please refer to `examples/LRA/README.md`.
+
+## TODO [Finish]
+
+- [x] release the source code
   - [x] [2021.10.19] Pre-train Tasks 
   - [x] [2021.10.19] GLUE Tasks
   - [x] [2022.03.15] LRA Tasks
-  - [ ] Long-Text Tasks
+  - [x] [2022.07.09] Long-Text Tasks
 - [x] [2021.10.19] release the pretrained checkpoints
+
+## Update
+
+- The pretrained checkpoint is moved to GDrive.
 
 ## Cite
 
