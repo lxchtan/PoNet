@@ -1,5 +1,5 @@
 num_train_epochs=4
-MODEL=outputs/ponet-base-uncased
+MODEL=chtan/ponet-base-uncased
 OUTPRE=`pwd`
 
 if [ ! -d logs/glue ]; then

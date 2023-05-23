@@ -1,139 +1,80 @@
 from transformers.trainer import Trainer
-import collections
-import inspect
+
 import math
 import os
-import random
-import re
 import shutil
 import sys
-import tempfile
 import time
-import warnings
-from logging import StreamHandler
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 from tqdm.auto import tqdm
 
 
 # Integrations must be imported before ML frameworks:
-from transformers.integrations import (  # isort: split
-    default_hp_search_backend,
-    get_reporting_integration_callbacks,
+# isort: off
+from transformers.integrations import (
     hp_params,
     is_fairscale_available,
-    is_optuna_available,
-    is_ray_tune_available,
-    run_hp_search_optuna,
-    run_hp_search_ray,
 )
 
-import numpy as np
+# isort: on
+
 import torch
+import torch.distributed as dist
 from packaging import version
 from torch import nn
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data.dataset import Dataset, IterableDataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 from transformers import __version__
-from transformers.configuration_utils import PretrainedConfig
-from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
-from transformers.file_utils import (
-    CONFIG_NAME,
-    WEIGHTS_NAME,
-    PushToHubMixin,
-    is_apex_available,
-    is_datasets_available,
-    is_in_notebook,
-    is_sagemaker_dp_enabled,
-    is_sagemaker_mp_enabled,
-    is_torch_tpu_available,
-    is_training_run_on_sagemaker,
-)
-from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, unwrap_model
-from transformers.optimization import Adafactor, AdamW, get_scheduler
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, is_torch_less_than_1_11
 from transformers.trainer_callback import (
-    CallbackHandler,
     DefaultFlowCallback,
-    PrinterCallback,
     ProgressCallback,
-    TrainerCallback,
-    TrainerControl,
     TrainerState,
 )
 from transformers.trainer_pt_utils import (
-    DistributedLengthGroupedSampler,
-    DistributedSamplerWithLoop,
-    DistributedTensorGatherer,
     IterableDatasetShard,
-    LabelSmoother,
-    LengthGroupedSampler,
-    SequentialDistributedSampler,
-    ShardSampler,
-    distributed_broadcast_scalars,
-    distributed_concat,
-    find_batch_size,
-    get_parameter_names,
-    nested_concat,
-    nested_detach,
-    nested_numpify,
-    nested_truncate,
-    nested_xla_mesh_reduce,
-    reissue_pt_warnings,
+    get_model_param_count,
 )
 from transformers.trainer_utils import (
-    PREFIX_CHECKPOINT_DIR,
-    BestRun,
-    EvalLoopOutput,
-    EvalPrediction,
     HPSearchBackend,
-    PredictionOutput,
     ShardedDDPOption,
-    TrainerMemoryTracker,
     TrainOutput,
-    default_compute_objective,
-    default_hp_space,
-    denumpify_detensorize,
-    get_last_checkpoint,
-    set_seed,
+    has_length,
     speed_metrics,
 )
-from transformers.training_args import ParallelMode, TrainingArguments
-from transformers.utils import logging
-from transformers.utils.modeling_auto_mapping import MODEL_FOR_QUESTION_ANSWERING_MAPPING_NAMES
+from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
+from transformers.utils import (
+    is_accelerate_available,
+    is_apex_available,
+    is_datasets_available,
+    is_in_notebook,
+    is_safetensors_available,
+    is_sagemaker_mp_enabled,
+    is_torch_tpu_available,
+    logging,
+)
 
-
-_is_torch_generator_available = False
-_is_native_amp_available = False
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
 if is_in_notebook():
-  from .utils.notebook import NotebookProgressCallback
+  from transformers.utils.notebook import NotebookProgressCallback
 
   DEFAULT_PROGRESS_CALLBACK = NotebookProgressCallback
 
 if is_apex_available():
   from apex import amp
 
-if version.parse(torch.__version__) >= version.parse("1.6"):
-  _is_torch_generator_available = True
-  _is_native_amp_available = True
-  from torch.cuda.amp import autocast
-
 if is_datasets_available():
   import datasets
 
-if is_torch_tpu_available():
+if is_torch_tpu_available(check_device=False):
   import torch_xla.core.xla_model as xm
   import torch_xla.debug.metrics as met
   import torch_xla.distributed.parallel_loader as pl
@@ -147,25 +88,42 @@ if is_fairscale_available():
   from fairscale.optim import OSS
   from fairscale.optim.grad_scaler import ShardedGradScaler
 
-if is_sagemaker_dp_enabled():
-  import smdistributed.dataparallel.torch.distributed as dist
-  from smdistributed.dataparallel.torch.parallel.distributed import DistributedDataParallel as DDP
-else:
-  import torch.distributed as dist
 
 if is_sagemaker_mp_enabled():
   import smdistributed.modelparallel.torch as smp
+  from smdistributed.modelparallel import __version__ as SMP_VERSION
 
-  from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
+  IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
 
-if is_training_run_on_sagemaker():
-  logging.add_handler(StreamHandler(sys.stdout))
+  from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
+else:
+  IS_SAGEMAKER_MP_POST_1_10 = False
+
+
+if is_safetensors_available():
+  import safetensors.torch
+
+
+skip_first_batches = None
+if is_accelerate_available():
+  from accelerate import __version__ as accelerate_version
+
+  if version.parse(accelerate_version) >= version.parse("0.16"):
+    from accelerate import skip_first_batches
 
 
 if TYPE_CHECKING:
   import optuna
 
 logger = logging.get_logger(__name__)
+
+
+# Name of the files used for checkpointing
+TRAINING_ARGS_NAME = "training_args.bin"
+TRAINER_STATE_NAME = "trainer_state.json"
+OPTIMIZER_NAME = "optimizer.pt"
+SCHEDULER_NAME = "scheduler.pt"
+SCALER_NAME = "scaler.pt"
 
 
 class Classifier_Trainer(Trainer):
@@ -197,105 +155,14 @@ class SM_Trainer(Trainer):
     if logits is not None:
       bz = labels[0].shape[0] if type(labels) in [tuple, list] else labels.shape[0]
       mlm_loss = logits[0].view(1, 1).repeat(bz, 1)
-      sop_loss = logits[1].view(1, 1).repeat(bz, 1)
-      logits = tuple([mlm_loss, sop_loss,] + [l.argmax(dim=-1) for l in logits[2:]])
+      sso_loss = logits[1].view(1, 1).repeat(bz, 1)
+      logits = tuple([mlm_loss, sso_loss,] + [l.argmax(dim=-1) for l in logits[2:]])
     return (loss, logits, labels)
- 
-  def train(
-      self,
-      resume_from_checkpoint: Optional[Union[str, bool]] = None,
-      trial: Union["optuna.Trial", Dict[str, Any]] = None,
-      **kwargs,
+
+  def _inner_training_loop(
+      self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
   ):
-    """
-    Main training entry point.
-
-    Args:
-        resume_from_checkpoint (:obj:`str` or :obj:`bool`, `optional`):
-            If a :obj:`str`, local path to a saved checkpoint as saved by a previous instance of
-            :class:`~transformers.Trainer`. If a :obj:`bool` and equals `True`, load the last checkpoint in
-            `args.output_dir` as saved by a previous instance of :class:`~transformers.Trainer`. If present,
-            training will resume from the model/optimizer/scheduler states loaded here.
-        trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
-            The trial run or the hyperparameter dictionary for hyperparameter search.
-        kwargs:
-            Additional keyword arguments used to hide deprecated arguments
-    """
-
-    # memory metrics - must set up as early as possible
-    self._memory_tracker.start()
-
-    args = self.args
-
-    self.is_in_train = True
-
-    # do_train is not a reliable argument, as it might not be set and .train() still called, so
-    # the following is a workaround:
-    if args.fp16_full_eval and not args.do_train:
-      self.model = self.model.to(args.device)
-
-    if "model_path" in kwargs:
-      resume_from_checkpoint = kwargs.pop("model_path")
-      warnings.warn(
-          "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
-          "instead.",
-          FutureWarning,
-      )
-    if len(kwargs) > 0:
-      raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
-    # This might change the seed so needs to run first.
-    self._hp_search_setup(trial)
-
-    # Model re-init
-    model_reloaded = False
-    if self.model_init is not None:
-      # Seed must be set before instantiating the model when using model_init.
-      set_seed(args.seed)
-      self.model = self.call_model_init(trial)
-      model_reloaded = True
-      # Reinitializes optimizer and scheduler
-      self.optimizer, self.lr_scheduler = None, None
-
-    # Load potential model checkpoint
-    if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
-      resume_from_checkpoint = get_last_checkpoint(args.output_dir)
-      if resume_from_checkpoint is None:
-        raise ValueError(f"No valid checkpoint found in output directory ({args.output_dir})")
-
-    if resume_from_checkpoint is not None:
-      if not os.path.isfile(os.path.join(resume_from_checkpoint, WEIGHTS_NAME)):
-        raise ValueError(f"Can't find a valid checkpoint at {resume_from_checkpoint}")
-
-      logger.info(f"Loading model from {resume_from_checkpoint}).")
-
-      if os.path.isfile(os.path.join(resume_from_checkpoint, CONFIG_NAME)):
-        config = PretrainedConfig.from_json_file(os.path.join(resume_from_checkpoint, CONFIG_NAME))
-        checkpoint_version = config.transformers_version
-        if checkpoint_version is not None and checkpoint_version != __version__:
-          logger.warn(
-              f"You are resuming training from a checkpoint trained with {checkpoint_version} of "
-              f"Transformers but your current version is {__version__}. This is not recommended and could "
-              "yield to errors or unwanted behaviors."
-          )
-
-      if args.deepspeed:
-        # will be resumed in deepspeed_init
-        pass
-      else:
-        # We load the model state dict on the CPU to avoid an OOM error.
-        state_dict = torch.load(os.path.join(resume_from_checkpoint, WEIGHTS_NAME), map_location="cpu")
-        # If the model is on the GPU, it still works!
-        self._load_state_dict_in_model(state_dict)
-
-    # If model was re-initialized, put it on the right device and update self.model_wrapped
-    if model_reloaded:
-      if self.place_model_on_device:
-        self.model = self.model.to(args.device)
-      self.model_wrapped = self.model
-
-    # Keeping track whether we can can len() on the dataset or not
-    train_dataset_is_sized = isinstance(self.train_dataset, collections.abc.Sized)
-
+    self._train_batch_size = batch_size
     # Data loader and number of training steps
     train_dataloader = self.get_train_dataloader()
 
@@ -304,32 +171,63 @@ class SM_Trainer(Trainer):
     # number of training steps per epoch: num_update_steps_per_epoch
     # total number of training steps to execute: max_steps
     total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * args.world_size
-    if train_dataset_is_sized:
-      num_update_steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
+
+    len_dataloader = None
+    if has_length(train_dataloader):
+      len_dataloader = len(train_dataloader)
+      num_update_steps_per_epoch = len_dataloader // args.gradient_accumulation_steps
       num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
+      num_examples = self.num_examples(train_dataloader)
       if args.max_steps > 0:
         max_steps = args.max_steps
         num_train_epochs = args.max_steps // num_update_steps_per_epoch + int(
             args.max_steps % num_update_steps_per_epoch > 0
         )
-        # May be slightly incorrect if the last batch in the training datalaoder has a smaller size but it's
+        # May be slightly incorrect if the last batch in the training dataloader has a smaller size but it's
         # the best we can do.
         num_train_samples = args.max_steps * total_train_batch_size
       else:
         max_steps = math.ceil(args.num_train_epochs * num_update_steps_per_epoch)
         num_train_epochs = math.ceil(args.num_train_epochs)
-        num_train_samples = len(self.train_dataset) * args.num_train_epochs
-    else:
-      # see __init__. max_steps is set when the dataset has no __len__
+        num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
+    elif args.max_steps > 0:  # Rely on max_steps when dataloader does not have a working size
       max_steps = args.max_steps
-      num_train_epochs = int(args.num_train_epochs)
+      # Setting a very large number of epochs so we go as many times as necessary over the iterator.
+      num_train_epochs = sys.maxsize
       num_update_steps_per_epoch = max_steps
+      num_examples = total_train_batch_size * args.max_steps
       num_train_samples = args.max_steps * total_train_batch_size
+    else:
+      raise ValueError(
+          "args.max_steps must be set to a positive value if dataloader does not have a length, was"
+          f" {args.max_steps}"
+      )
+
+    # Compute absolute values for logging, eval, and save if given as ratio
+    if args.logging_steps and args.logging_steps < 1:
+      args.logging_steps = math.ceil(max_steps * args.logging_steps)
+    if args.eval_steps and args.eval_steps < 1:
+      args.eval_steps = math.ceil(max_steps * args.eval_steps)
+    if args.save_steps and args.save_steps < 1:
+      args.save_steps = math.ceil(max_steps * args.save_steps)
 
     if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
-      debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
+      if self.args.n_gpu > 1:
+        # nn.DataParallel(model) replicates the model, creating new variables and module
+        # references registered here no longer work on other gpus, breaking the module
+        raise ValueError(
+            "Currently --debug underflow_overflow is not supported under DP. Please use DDP"
+            " (torch.distributed.launch)."
+        )
+      else:
+        debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
-    delay_optimizer_creation = self.sharded_ddp is not None and self.sharded_ddp != ShardedDDPOption.SIMPLE
+    delay_optimizer_creation = (
+        self.sharded_ddp is not None
+        and self.sharded_ddp != ShardedDDPOption.SIMPLE
+        or is_sagemaker_mp_enabled()
+        or self.fsdp is not None
+    )
     if args.deepspeed:
       deepspeed_engine, optimizer, lr_scheduler = deepspeed_init(
           self, num_training_steps=max_steps, resume_from_checkpoint=resume_from_checkpoint
@@ -345,7 +243,14 @@ class SM_Trainer(Trainer):
     self.state = TrainerState()
     self.state.is_hyper_param_search = trial is not None
 
+    # Activate gradient checkpointing if needed
+    if args.gradient_checkpointing:
+      self.model.gradient_checkpointing_enable()
+
     model = self._wrap_model(self.model_wrapped)
+
+    if is_sagemaker_mp_enabled() and resume_from_checkpoint is not None:
+      self._load_from_checkpoint(resume_from_checkpoint, model)
 
     # for the rest of this function `model` is the outside model, whether it was wrapped or not
     if model is not self.model:
@@ -362,17 +267,14 @@ class SM_Trainer(Trainer):
     # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model), etc.
 
     # Train!
-    num_examples = (
-        self.num_examples(train_dataloader) if train_dataset_is_sized else total_train_batch_size * args.max_steps
-    )
-
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {num_examples}")
-    logger.info(f"  Num Epochs = {num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
+    logger.info(f"  Num examples = {num_examples:,}")
+    logger.info(f"  Num Epochs = {num_train_epochs:,}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size:,}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size:,}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {max_steps}")
+    logger.info(f"  Total optimization steps = {max_steps:,}")
+    logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
     self.state.epoch = 0
     start_time = time.time()
@@ -382,9 +284,9 @@ class SM_Trainer(Trainer):
 
     # Check if continuing training from a checkpoint
     if resume_from_checkpoint is not None and os.path.isfile(
-        os.path.join(resume_from_checkpoint, "trainer_state.json")
+        os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
     ):
-      self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, "trainer_state.json"))
+      self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
       epochs_trained = self.state.global_step // num_update_steps_per_epoch
       if not args.ignore_data_skip:
         steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
@@ -396,12 +298,20 @@ class SM_Trainer(Trainer):
       logger.info(f"  Continuing training from epoch {epochs_trained}")
       logger.info(f"  Continuing training from global step {self.state.global_step}")
       if not args.ignore_data_skip:
-        logger.info(
-            f"  Will skip the first {epochs_trained} epochs then the first {steps_trained_in_current_epoch} "
-            "batches in the first epoch. If this takes a lot of time, you can add the `--ignore_data_skip` "
-            "flag to your launch command, but you will resume the training on data already seen by your model."
-        )
-        if self.is_local_process_zero() and not args.disable_tqdm:
+        if skip_first_batches is None:
+          logger.info(
+              f"  Will skip the first {epochs_trained} epochs then the first"
+              f" {steps_trained_in_current_epoch} batches in the first epoch. If this takes a lot of time,"
+              " you can install the latest version of Accelerate with `pip install -U accelerate`.You can"
+              " also add the `--ignore_data_skip` flag to your launch command, but you will resume the"
+              " training on data already seen by your model."
+          )
+        else:
+          logger.info(
+              f"  Will skip the first {epochs_trained} epochs then the first"
+              f" {steps_trained_in_current_epoch} batches in the first epoch."
+          )
+        if self.is_local_process_zero() and not args.disable_tqdm and skip_first_batches is None:
           steps_trained_progress_bar = tqdm(total=steps_trained_in_current_epoch)
           steps_trained_progress_bar.set_description("Skipping the first batches")
 
@@ -410,8 +320,15 @@ class SM_Trainer(Trainer):
     self.callback_handler.optimizer = self.optimizer
     self.callback_handler.lr_scheduler = self.lr_scheduler
     self.callback_handler.train_dataloader = train_dataloader
-    self.state.trial_name = self.hp_name(trial) if self.hp_name is not None else None
-    self.state.trial_params = hp_params(trial) if trial is not None else None
+    if self.hp_name is not None and self._trial is not None:
+      # use self._trial because the SigOpt/Optuna hpo only call `_hp_search_setup(trial)` instead of passing trial
+      # parameter to Train when using DDP.
+      self.state.trial_name = self.hp_name(self._trial)
+    if trial is not None:
+      assignments = trial.assignments if self.hp_search_backend == HPSearchBackend.SIGOPT else trial
+      self.state.trial_params = hp_params(assignments)
+    else:
+      self.state.trial_params = None
     # This should be the same if the state has been saved but in case the training arguments changed, it's safer
     # to set this after the load.
     self.state.max_steps = max_steps
@@ -422,12 +339,11 @@ class SM_Trainer(Trainer):
     # tr_loss is a tensor to avoid synchronization of TPUs through .item()
     tr_loss = torch.tensor(0.0).to(args.device)
     mlm_tr_loss = torch.tensor(0.0).to(args.device)
-    sop_tr_loss = torch.tensor(0.0).to(args.device)
+    sso_tr_loss = torch.tensor(0.0).to(args.device)
     # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
     self._total_loss_scalar = 0.0
     self._mlm_total_loss_scalar = 0.0
     self._sop_total_loss_scalar = 0.0
-
     self._globalstep_last_logged = self.state.global_step
     model.zero_grad()
 
@@ -436,14 +352,24 @@ class SM_Trainer(Trainer):
     # Skip the first epochs_trained epochs to get the random state of the dataloader at the right point.
     if not args.ignore_data_skip:
       for epoch in range(epochs_trained):
-        # We just need to begin an iteration to create the randomization of the sampler.
-        for _ in train_dataloader:
-          break
+        is_random_sampler = hasattr(train_dataloader, "sampler") and isinstance(
+            train_dataloader.sampler, RandomSampler
+        )
+        if is_torch_less_than_1_11 or not is_random_sampler:
+          # We just need to begin an iteration to create the randomization of the sampler.
+          # That was before PyTorch 1.11 however...
+          for _ in train_dataloader:
+            break
+        else:
+          # Otherwise we need to call the whooooole sampler cause there is some random operation added
+          # AT THE VERY END!
+          _ = list(train_dataloader.sampler)
 
+    total_batched_samples = 0
     for epoch in range(epochs_trained, num_train_epochs):
       if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
         train_dataloader.sampler.set_epoch(epoch)
-      elif isinstance(train_dataloader.dataset, IterableDatasetShard):
+      elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
         train_dataloader.dataset.set_epoch(epoch)
 
       if is_torch_tpu_available():
@@ -457,11 +383,29 @@ class SM_Trainer(Trainer):
         self._past = None
 
       steps_in_epoch = (
-          len(epoch_iterator) if train_dataset_is_sized else args.max_steps * args.gradient_accumulation_steps
+          len(epoch_iterator)
+          if len_dataloader is not None
+          else args.max_steps * args.gradient_accumulation_steps
       )
       self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
+      if epoch == epochs_trained and resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
+        self._load_rng_state(resume_from_checkpoint)
+
+      rng_to_sync = False
+      steps_skipped = 0
+      if skip_first_batches is not None and steps_trained_in_current_epoch > 0:
+        epoch_iterator = skip_first_batches(epoch_iterator, steps_trained_in_current_epoch)
+        steps_skipped = steps_trained_in_current_epoch
+        steps_trained_in_current_epoch = 0
+        rng_to_sync = True
+
+      step = -1
       for step, inputs in enumerate(epoch_iterator):
+        total_batched_samples += 1
+        if rng_to_sync:
+          self._load_rng_state(resume_from_checkpoint)
+          rng_to_sync = False
 
         # Skip past any already trained steps if resuming training
         if steps_trained_in_current_epoch > 0:
@@ -479,28 +423,38 @@ class SM_Trainer(Trainer):
           self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
         if (
-            ((step + 1) % args.gradient_accumulation_steps != 0)
-            and args.local_rank != -1
+            (total_batched_samples % args.gradient_accumulation_steps != 0)
+            and args.parallel_mode == ParallelMode.DISTRIBUTED
             and args._no_sync_in_gradient_accumulation
+            and hasattr(model, "no_sync")
         ):
           # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
           with model.no_sync():
-            l, mlm, sop = self.training_step(model, inputs)
-            tr_loss += l
-            mlm_tr_loss += mlm
-            sop_tr_loss += sop
+            tr_loss_step, mlm_loss_step, sso_loss_step = self.training_step(model, inputs)
         else:
-          l, mlm, sop = self.training_step(model, inputs)
-          tr_loss += l
-          mlm_tr_loss += mlm
-          sop_tr_loss += sop
+          tr_loss_step, mlm_loss_step, sso_loss_step = self.training_step(model, inputs)
+
+        if (
+            args.logging_nan_inf_filter
+            and not is_torch_tpu_available()
+            and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+        ):
+          # if loss is nan or inf simply add the average of previous logged losses
+          tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+          mlm_tr_loss += mlm_loss_step / (1 + self.state.global_step - self._globalstep_last_logged)
+          sso_tr_loss += sso_loss_step / (1 + self.state.global_step - self._globalstep_last_logged)
+        else:
+          tr_loss += tr_loss_step
+          mlm_tr_loss += mlm_loss_step
+          sso_tr_loss += sso_loss_step
+
         self.current_flos += float(self.floating_point_ops(inputs))
 
         # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
         if self.deepspeed:
           self.deepspeed.step()
 
-        if (step + 1) % args.gradient_accumulation_steps == 0 or (
+        if total_batched_samples % args.gradient_accumulation_steps == 0 or (
             # last step in epoch but step is always smaller than gradient_accumulation_steps
             steps_in_epoch <= args.gradient_accumulation_steps
             and (step + 1) == steps_in_epoch
@@ -509,11 +463,17 @@ class SM_Trainer(Trainer):
           if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
             # deepspeed does its own clipping
 
-            if self.use_amp:
+            if self.do_grad_scaling:
+              # Reduce gradients first for XLA
+              if is_torch_tpu_available():
+                gradients = xm._fetch_gradients(self.optimizer)
+                xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
               # AMP: gradients need unscaling
               self.scaler.unscale_(self.optimizer)
 
-            if hasattr(self.optimizer, "clip_grad_norm"):
+            if is_sagemaker_mp_enabled() and args.fp16:
+              self.optimizer.clip_master_grads(args.max_grad_norm)
+            elif hasattr(self.optimizer, "clip_grad_norm"):
               # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
               self.optimizer.clip_grad_norm(args.max_grad_norm)
             elif hasattr(model, "clip_grad_norm_"):
@@ -531,8 +491,12 @@ class SM_Trainer(Trainer):
           if self.deepspeed:
             pass  # called outside the loop
           elif is_torch_tpu_available():
-            xm.optimizer_step(self.optimizer)
-          elif self.use_amp:
+            if self.do_grad_scaling:
+              self.scaler.step(self.optimizer)
+              self.scaler.update()
+            else:
+              xm.optimizer_step(self.optimizer)
+          elif self.do_grad_scaling:
             scale_before = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -542,20 +506,31 @@ class SM_Trainer(Trainer):
             self.optimizer.step()
 
           if optimizer_was_run and not self.deepspeed:
-            self.lr_scheduler.step()
+            # Delay optimizer scheduling until metrics are generated
+            if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+              self.lr_scheduler.step()
 
           model.zero_grad()
           self.state.global_step += 1
-          self.state.epoch = epoch + (step + 1) / steps_in_epoch
+          self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
           self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-          self._maybe_log_save_evaluate(tr_loss, mlm_tr_loss, sop_tr_loss, model, trial, epoch)
+          self._maybe_log_save_evaluate(tr_loss, mlm_tr_loss, sso_tr_loss, model, trial, epoch, ignore_keys_for_eval)
+        else:
+          self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
         if self.control.should_epoch_stop or self.control.should_training_stop:
           break
+      if step < 0:
+        logger.warning(
+            "There seems to be not a single sample in your epoch_iterator, stopping training at step"
+            f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
+            f" num_steps ({max_steps}) higher than the number of available samples."
+        )
+        self.control.should_training_stop = True
 
       self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-      self._maybe_log_save_evaluate(tr_loss, mlm_tr_loss, sop_tr_loss, model, trial, epoch)
+      self._maybe_log_save_evaluate(tr_loss, mlm_tr_loss, sso_tr_loss, model, trial, epoch, ignore_keys_for_eval)
 
       if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
         if is_torch_tpu_available():
@@ -578,37 +553,28 @@ class SM_Trainer(Trainer):
       # Wait for everyone to get here so we are sur the model has been saved by process 0.
       if is_torch_tpu_available():
         xm.rendezvous("load_best_model_at_end")
-      elif args.local_rank != -1:
+      elif args.parallel_mode == ParallelMode.DISTRIBUTED:
         dist.barrier()
+      elif is_sagemaker_mp_enabled():
+        smp.barrier()
 
-      logger.info(
-          f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric})."
-      )
-      # We load the model state dict on the CPU to avoid an OOM error.
-      state_dict = torch.load(os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME), map_location="cpu")
-      # If the model is on the GPU, it still works!
-      self._load_state_dict_in_model(state_dict)
-
-      if self.deepspeed:
-        self.deepspeed.load_checkpoint(
-            self.state.best_model_checkpoint, load_optimizer_states=False, load_lr_scheduler_states=False
-        )
+      self._load_best_model()
 
     # add remaining tr_loss
     self._total_loss_scalar += tr_loss.item()
     self._mlm_total_loss_scalar += mlm_tr_loss.item()
-    self._sop_total_loss_scalar += sop_tr_loss.item()
+    self._sop_total_loss_scalar += sso_tr_loss.item()
 
     train_loss = self._total_loss_scalar / self.state.global_step
     train_mlm_loss = self._mlm_total_loss_scalar / self.state.global_step
-    train_sop_loss = self._sop_total_loss_scalar / self.state.global_step
+    train_sso_loss = self._sop_total_loss_scalar / self.state.global_step
 
     metrics = speed_metrics("train", start_time, num_samples=num_train_samples, num_steps=self.state.max_steps)
     self.store_flos()
     metrics["total_flos"] = self.state.total_flos
     metrics["train_loss"] = train_loss
     metrics["train_mlm_loss"] = train_mlm_loss
-    metrics["train_sop_loss"] = train_sop_loss
+    metrics["train_sso_loss"] = train_sso_loss
 
     self.is_in_train = False
 
@@ -616,32 +582,45 @@ class SM_Trainer(Trainer):
 
     self.log(metrics)
 
+    run_dir = self._get_output_dir(trial)
+    checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
+
+    # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
+    if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
+      for checkpoint in checkpoints_sorted:
+        if checkpoint != self.state.best_model_checkpoint:
+          logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
+          shutil.rmtree(checkpoint)
+
     self.control = self.callback_handler.on_train_end(args, self.state, self.control)
 
     return TrainOutput(self.state.global_step, train_loss, metrics)
 
-  def _maybe_log_save_evaluate(self, tr_loss, mlm_tr_loss, sop_tr_loss, model, trial, epoch):
+  def _maybe_log_save_evaluate(self, tr_loss, mlm_tr_loss, sso_tr_loss, model, trial, epoch, ignore_keys_for_eval):
     if self.control.should_log:
+      if is_torch_tpu_available():
+        xm.mark_step()
+
       logs: Dict[str, float] = {}
-      tr_loss_scalar = tr_loss.item()
-      mlm_tr_loss_scalar = mlm_tr_loss.item()
-      sop_tr_loss_scalar = sop_tr_loss.item()
+
+      # all_gather + mean() to get average loss over all processes
+      tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+      mlm_tr_loss_scalar = self._nested_gather(mlm_tr_loss).mean().item()
+      sso_tr_loss_scalar = self._nested_gather(sso_tr_loss).mean().item()
 
       # reset tr_loss to zero
       tr_loss -= tr_loss
       mlm_tr_loss -= mlm_tr_loss
-      sop_tr_loss -= sop_tr_loss
+      sso_tr_loss -= sso_tr_loss
 
       logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
       logs["mlm_loss"] = round(mlm_tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-      logs["sop_loss"] = round(sop_tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-
+      logs["sso_loss"] = round(sso_tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
       logs["learning_rate"] = self._get_learning_rate()
 
       self._total_loss_scalar += tr_loss_scalar
       self._mlm_total_loss_scalar += mlm_tr_loss_scalar
-      self._sop_total_loss_scalar += sop_tr_loss_scalar
-
+      self._sop_total_loss_scalar += sso_tr_loss_scalar
       self._globalstep_last_logged = self.state.global_step
       self.store_flos()
 
@@ -649,8 +628,22 @@ class SM_Trainer(Trainer):
 
     metrics = None
     if self.control.should_evaluate:
-      metrics = self.evaluate()
-      self._report_to_hp_search(trial, epoch, metrics)
+      if isinstance(self.eval_dataset, dict):
+        metrics = {}
+        for eval_dataset_name, eval_dataset in self.eval_dataset.items():
+          dataset_metrics = self.evaluate(
+              eval_dataset=eval_dataset,
+              ignore_keys=ignore_keys_for_eval,
+              metric_key_prefix=f"eval_{eval_dataset_name}",
+          )
+          metrics.update(dataset_metrics)
+      else:
+        metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+      self._report_to_hp_search(trial, self.state.global_step, metrics)
+
+      # Run delayed LR scheduler now that metrics are populated
+      if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+        self.lr_scheduler.step(metrics[self.args.metric_for_best_model])
 
     if self.control.should_save:
       self._save_checkpoint(model, trial, metrics=metrics)
@@ -663,46 +656,42 @@ class SM_Trainer(Trainer):
     Subclass and override to inject custom behavior.
 
     Args:
-        model (:obj:`nn.Module`):
+        model (`nn.Module`):
             The model to train.
-        inputs (:obj:`Dict[str, Union[torch.Tensor, Any]]`):
+        inputs (`Dict[str, Union[torch.Tensor, Any]]`):
             The inputs and targets of the model.
 
             The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
-            argument :obj:`labels`. Check your model's documentation for all accepted arguments.
+            argument `labels`. Check your model's documentation for all accepted arguments.
 
     Return:
-        :obj:`torch.Tensor`: The tensor with training loss on this batch.
+        `torch.Tensor`: The tensor with training loss on this batch.
     """
     model.train()
     inputs = self._prepare_inputs(inputs)
 
     if is_sagemaker_mp_enabled():
-      scaler = self.scaler if self.use_amp else None
-      loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps, scaler=scaler)
+      loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
       return loss_mb.reduce_mean().detach().to(self.args.device)
 
-    if self.use_amp:
-      with autocast():
-        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
-    else:
+    with self.compute_loss_context_manager():
       loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
 
     mlm_loss = outputs['mlm_loss'].detach()
-    sop_loss = outputs['sop_loss'].detach()
+    sso_loss = outputs['sso_loss'].detach()
 
     if self.args.n_gpu > 1:
       loss = loss.mean()  # mean() to average on multi-gpu parallel training
       mlm_loss = mlm_loss.mean()
-      sop_loss = sop_loss.mean()
+      sso_loss = sso_loss.mean()
 
     if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
       # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
       loss = loss / self.args.gradient_accumulation_steps
       mlm_loss = mlm_loss / self.args.gradient_accumulation_steps
-      sop_loss = sop_loss / self.args.gradient_accumulation_steps
+      sso_loss = sso_loss / self.args.gradient_accumulation_steps
 
-    if self.use_amp:
+    if self.do_grad_scaling:
       self.scaler.scale(loss).backward()
     elif self.use_apex:
       with amp.scale_loss(loss, self.optimizer) as scaled_loss:
@@ -713,4 +702,4 @@ class SM_Trainer(Trainer):
     else:
       loss.backward()
 
-    return loss.detach(), mlm_loss, sop_loss
+    return loss.detach(), mlm_loss, sso_loss

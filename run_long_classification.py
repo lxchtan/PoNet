@@ -26,8 +26,6 @@ from typing import Optional
 
 import numpy as np
 from datasets import load_dataset, load_metric
-from extra.tokenizer import PreTrainedTokenizerBase as newPreTrainedTokenizerBase
-
 
 import transformers
 from transformers import (
@@ -46,11 +44,10 @@ from transformers import (
 
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
-from models.modeling_ponet import PoNetForSequenceClassification
 from nltk.tokenize import sent_tokenize
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.6.0")
+check_min_version("4.21.3")
 
 task_to_metrics = {
     "arxiv": ("metrics/micro_f1_and_acc", None),
@@ -270,6 +267,7 @@ def main():
       cache_dir=model_args.cache_dir,
       revision=model_args.model_revision,
       use_auth_token=True if model_args.use_auth_token else None,
+      trust_remote_code=True
   )
   tokenizer = AutoTokenizer.from_pretrained(
       model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -277,21 +275,22 @@ def main():
       use_fast=model_args.use_fast_tokenizer,
       revision=model_args.model_revision,
       use_auth_token=True if model_args.use_auth_token else None,
+      trust_remote_code=True
   )
 
-  setattr(tokenizer.__class__, '_pad', newPreTrainedTokenizerBase._pad)
 
   if model_args.gc:
     config.gradient_checkpointing = True
     config.use_cache = False
 
-  model = PoNetForSequenceClassification.from_pretrained(
+  model = AutoModelForSequenceClassification.from_pretrained(
       model_args.model_name_or_path,
       from_tf=bool(".ckpt" in model_args.model_name_or_path),
       config=config,
       cache_dir=model_args.cache_dir,
       revision=model_args.model_revision,
       use_auth_token=True if model_args.use_auth_token else None,
+      trust_remote_code=True
   )
 
   # extend position embeddings

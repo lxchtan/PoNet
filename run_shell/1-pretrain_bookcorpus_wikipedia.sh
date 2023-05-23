@@ -1,9 +1,13 @@
 SUFFIX=PoNet_bookcourpus_wikipedia_dupe5
 LOGNAME=`date +%Y%m%d%H`_${SUFFIX}.log
 OUTPUT=outputs/${SUFFIX}
-MODEL_PATH=outputs/ponet-base-uncased
+MODEL_PATH=chtan/ponet-base-uncased
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -u -m torch.distributed.launch --nproc_per_node=4 --master_port 31030 run_pretrained.py \
+if [ ! -d logs ]; then
+  mkdir logs
+fi
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port 31030 run_pretrained.py \
     --config_name ${MODEL_PATH} \
     --tokenizer_name ${MODEL_PATH} \
     --dataset_name bookcorpus \

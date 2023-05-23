@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from extra.dataset_dict import DatasetDict as newDatasetDict
-from extra.tokenizer import PreTrainedTokenizerBase as newPreTrainedTokenizerBase
 
 from datasets import load_dataset, concatenate_datasets
 
@@ -40,6 +39,7 @@ from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
     AutoConfig,
+    AutoModelForPreTraining,
     EvalPrediction,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
@@ -50,11 +50,10 @@ from transformers import (
 from extra.classifier_trainer import SM_Trainer as Trainer
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
-from models.modeling_ponet import PoNetForPreTraining
 import random
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.6.0")
+check_min_version("4.21.3")
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -271,7 +270,6 @@ def main():
           split=f"train[{data_args.validation_split_percentage}%:]",
           cache_dir=model_args.cache_dir,
       )
-    # datasets_2 = load_dataset("wikitext", "wikitext-103-raw-v1", cache_dir=model_args.cache_dir)
     if data_args.dataset2_name is not None:
       datasets_2 = load_dataset(data_args.dataset2_name, data_args.dataset2_config_name, cache_dir=model_args.cache_dir)
       for k in datasets.keys():
@@ -302,6 +300,7 @@ def main():
       "cache_dir": model_args.cache_dir,
       "revision": model_args.model_revision,
       "use_auth_token": True if model_args.use_auth_token else None,
+      "trust_remote_code": True,
   }
   if model_args.config_name:
     config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
@@ -316,7 +315,8 @@ def main():
       "use_fast": model_args.use_fast_tokenizer,
       "revision": model_args.model_revision,
       "use_auth_token": True if model_args.use_auth_token else None,
-      "model_input_names": ['input_ids', 'token_type_ids', 'attention_mask', 'segment_ids']
+      "model_input_names": ['input_ids', 'token_type_ids', 'attention_mask', 'segment_ids'],
+      "trust_remote_code": True,
   }
   if model_args.tokenizer_name:
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
@@ -328,21 +328,19 @@ def main():
         "You can do it from another script, save it, and load it from here, using --tokenizer_name."
     )
 
-  # XXX: inject patch, reconstruct later
-  setattr(tokenizer.__class__, '_pad', newPreTrainedTokenizerBase._pad)
-
   if model_args.model_name_or_path:
-    model = PoNetForPreTraining.from_pretrained(
+    model = AutoModelForPreTraining.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        trust_remote_code=True
     )
   else:
     logger.info("Training new model from scratch")
-    model = PoNetForPreTraining(config)
+    model = AutoModelForPreTraining.from_config(config, trust_remote_code=True)
 
   model.resize_token_embeddings(len(tokenizer))
 
@@ -416,7 +414,7 @@ def main():
     def group_texts(examples):
       """Creates examples for a single document."""
       results = {k:[] for k in examples.keys()}
-      results["next_sentence_label"] = []
+      results["sentence_structural_label"] = []
       results["segment_ids"] = []
       for _ in range(data_args.dupe_factor):
         # Account for special tokens
@@ -545,7 +543,7 @@ def main():
               results["input_ids"].append(input_ids)
               results["token_type_ids"].append(token_type_ids)
               results["attention_mask"].append(attention_mask)
-              results["next_sentence_label"].append(is_next)
+              results["sentence_structural_label"].append(is_next)
               results["special_tokens_mask"].append([1] + [0] * len(tokens_a) + [1] + [0] * len(tokens_b) + [1])
 
               a_segment_ids = [asi-a_segment_ids[0]+1 for asi in a_segment_ids]

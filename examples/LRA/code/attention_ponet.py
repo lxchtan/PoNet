@@ -1,12 +1,13 @@
 import torch
 from torch import nn
-from torch_scatter import scatter_max
 import math
 
 def segment_max(src, index, dim=1):
-  out, _ = scatter_max(src, index, dim=dim)
+  out = torch.zeros_like(src).scatter_reduce(
+      dim, index.unsqueeze(-1).expand_as(src), src, reduce="amax", include_self=False
+  )
   dummy = index.unsqueeze(-1).expand(*index.shape[:2], out.size(-1))
-  return torch.gather(out, dim, dummy)
+  return torch.gather(out, dim, dummy).to(dtype=src.dtype)
 
 def get_win_max(hidden_states, kernel_size=3):
   m = nn.MaxPool1d(kernel_size, stride=1, padding=kernel_size//2)

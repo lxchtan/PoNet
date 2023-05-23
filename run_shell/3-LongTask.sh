@@ -1,11 +1,11 @@
-MODEL=outputs/ponet-base-uncased
+MODEL=chtan/ponet-base-uncased
 OUTPRE=`pwd`
 
 cal(){
   NAME=`date +%Y%m%d%H`_${MAINTASK}_ep${num_train_epochs}_bz$((bz*GAS))_lr${lr}
   OUTPUT=outputs/${MAINTASK}/${NAME}
 
-  CUDA_VISIBLE_DEVICES=${GPUID} python -u -m torch.distributed.launch --nproc_per_node=${GPU_NUMS} run_long_classification.py \
+  CUDA_VISIBLE_DEVICES=${GPUID} torchrun --nproc_per_node=${GPU_NUMS} run_long_classification.py \
     --model_name_or_path ${MODEL} \
     --task_name ${MAINTASK} \
     --overwrite_output_dir \
